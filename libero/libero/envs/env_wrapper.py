@@ -276,3 +276,28 @@ class DemoRenderEnv(ControlEnv):
 
     def _get_observations(self):
         return self.env._get_observations()
+
+
+class OnScreenRenderEnv(ControlEnv):
+    """
+    Environment with on-screen rendering enabled for visualization.
+    """
+
+    def __init__(self, **kwargs):
+        # Enable on-screen rendering
+        kwargs["has_renderer"] = True
+        kwargs["has_offscreen_renderer"] = True  # Keep both for compatibility
+        kwargs["render_camera"] = "frontview"  # Set default camera
+        super().__init__(**kwargs)
+
+    def _get_observations(self):
+        return self.env._get_observations()
+    
+    def render(self):
+        """Explicitly render the environment."""
+        if hasattr(self.env, 'render'):
+            return self.env.render()
+        elif hasattr(self.env, 'viewer') and self.env.viewer is not None:
+            self.env.viewer.render()
+        else:
+            print("[warning] No renderer available for display")
