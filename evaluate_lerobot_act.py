@@ -180,10 +180,12 @@ def get_task_info(cfg, task_id):
         seq_len=cfg.data.seq_len,
     )
     
-    # Get task embedding
-    descriptions = [benchmark_instance.get_task(task_id).language]
+    # Get task embeddings for ALL tasks in the benchmark (required by LIBERO framework)
+    descriptions = [benchmark_instance.get_task(i).language for i in range(n_tasks)]
     task_embs = get_task_embs(cfg, descriptions)
     benchmark_instance.set_task_embs(task_embs)
+    
+    # Now we can safely get the specific task embedding
     task_emb = benchmark_instance.get_task_emb(task_id)
     
     return benchmark_instance, task, task_emb, shape_meta
