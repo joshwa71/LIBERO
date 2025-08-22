@@ -6,3 +6,4 @@ from libero.lifelong.algos.ewc import EWC
 from libero.lifelong.algos.packnet import PackNet
 from libero.lifelong.algos.single_task import SingleTask
 from libero.lifelong.algos.lerobot_act_algo import LerobotACTAlgorithm
+from libero.lifelong.algos.lerobot_smolvla_algo import LerobotSmolVLAAlgorithm
