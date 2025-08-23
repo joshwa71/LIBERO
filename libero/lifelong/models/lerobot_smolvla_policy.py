@@ -7,6 +7,37 @@ from pathlib import Path
 from libero.lifelong.models.base_policy import BasePolicy
 from libero.lifelong.models.smolvla.modeling_smolvla import SmolVLAPolicy
 
+# quat_to_axis_angle function implementation to resolve the ModuleNotFoundError
+def quat_to_axis_angle(quat):
+    """
+    Converts a quaternion to an axis-angle representation.
+    
+    Args:
+        quat (torch.Tensor): A tensor of shape (..., 4) representing quaternions in (x, y, z, w) format.
+        
+    Returns:
+        torch.Tensor: A tensor of shape (..., 3) representing the axis-angle vector.
+    """
+    # Ensure w is the last component for calculations
+    xyz, w = quat[..., :3], quat[..., 3:]
+    
+    # Calculate the angle
+    angle = 2 * torch.acos(torch.clamp(w, -1.0, 1.0))
+    
+    # Calculate the axis
+    sin_half_angle = torch.sin(angle / 2)
+    
+    # Avoid division by zero for identity rotations (angle is zero)
+    # A small epsilon is used for numerical stability
+    axis = torch.where(
+        torch.abs(sin_half_angle) > 1e-6,
+        xyz / sin_half_angle,
+        torch.zeros_like(xyz)
+    )
+    
+    # The final axis-angle vector is axis * angle
+    return axis * angle
+
 
 class LerobotSmolVLAPolicy(BasePolicy):
     """
@@ -33,6 +64,9 @@ class LerobotSmolVLAPolicy(BasePolicy):
         self.device = cfg.device
         self.shape_meta = shape_meta
         self.pretrained_model_path = Path(pretrained_model_path)
+        
+        # Store task instruction - will be set by evaluation script
+        self.current_task_instruction = None
         
         # Load the pretrained SmolVLA policy
         print(f"Loading SmolVLA policy from: {self.pretrained_model_path}")
@@ -69,77 +103,68 @@ class LerobotSmolVLAPolicy(BasePolicy):
         except Exception as e:
             raise RuntimeError(f"Failed to load SmolVLA policy: {e}")
     
+    def set_task_instruction(self, task_instruction):
+        """
+        Set the task instruction for SmolVLA.
+        
+        Args:
+            task_instruction (str): The task instruction in natural language
+        """
+        self.current_task_instruction = task_instruction
+        print(f"Task instruction set to: {task_instruction}")
+    
     def _convert_libero_to_lerobot_obs(self, data):
         """
         Convert LIBERO observation format to Lerobot format.
-        
-        Args:
-            data (dict): LIBERO data format with keys:
-                - obs: dict with agentview_rgb, eye_in_hand_rgb, gripper_states, joint_states
-                - task_emb: task embedding (converted to text instruction)
-                
-        Returns:
-            dict: Lerobot observation format for SmolVLA
         """
         obs = data["obs"]
-        
-        # Extract components - handle both (B, T, ...) and (B, ...) cases
+
+        # Extract all necessary components
         agentview_rgb = obs["agentview_rgb"]
-        eye_in_hand_rgb = obs["eye_in_hand_rgb"] 
+        eye_in_hand_rgb = obs["eye_in_hand_rgb"]
         gripper_states = obs["gripper_states"]
         joint_states = obs["joint_states"]
-        
+        ee_pos = obs["ee_pos"]
+        ee_ori_quat = obs["ee_ori"]
+
         # Handle temporal dimension - take the last timestep if needed
-        if agentview_rgb.dim() == 5:  # (B, T, C, H, W)
-            agentview_rgb = agentview_rgb[:, -1]  # Take last timestep
-        if eye_in_hand_rgb.dim() == 5:  # (B, T, C, H, W)
-            eye_in_hand_rgb = eye_in_hand_rgb[:, -1]
-        if gripper_states.dim() == 3:  # (B, T, D)
-            gripper_states = gripper_states[:, -1]
-        if joint_states.dim() == 3:  # (B, T, D)
-            joint_states = joint_states[:, -1]
+        if agentview_rgb.dim() == 5:
+            agentview_rgb, eye_in_hand_rgb, gripper_states, joint_states, ee_pos, ee_ori_quat = [
+                x[:, -1] for x in [agentview_rgb, eye_in_hand_rgb, gripper_states, joint_states, ee_pos, ee_ori_quat]
+            ]
         
-        # For SmolVLA, we need to construct the 15D state vector:
-        # [ee_pos(3), ee_ori(3), gripper_states(2), joint_states(7)]
-        batch_size = joint_states.shape[0]
-        device = joint_states.device
-        
-        # Use zeros for ee_pos and ee_ori to match the conversion script behavior
-        ee_pos = torch.zeros(batch_size, 3, device=device, dtype=joint_states.dtype)
-        ee_ori = torch.zeros(batch_size, 3, device=device, dtype=joint_states.dtype)
-        
-        # Concatenate to form the 15D observation state
-        obs_state = torch.cat([ee_pos, ee_ori, gripper_states, joint_states], dim=-1)
-        
-        # Convert images from LIBERO format to SmolVLA format
-        # Images should be in [0,1] range for SmolVLA
-        agentview_rgb = agentview_rgb.float()
-        eye_in_hand_rgb = eye_in_hand_rgb.float() 
-        
-        # If images are in [0, 255], normalize to [0, 1]
-        if agentview_rgb.max() > 1.0:
-            agentview_rgb = agentview_rgb / 255.0
-        if eye_in_hand_rgb.max() > 1.0:
-            eye_in_hand_rgb = eye_in_hand_rgb / 255.0
-        
-        # Get task instruction - SmolVLA requires language instruction
-        # If task_emb is available, we need to convert it to text
-        # For now, we'll use the task from the LIBERO configuration
-        task_instruction = getattr(self.cfg, 'task_instruction', "Complete the task")
-        
-        # If we have access to the benchmark and task info, use that
-        if hasattr(data, 'task_str') and data['task_str']:
-            task_instruction = data['task_str']
-        elif 'task' in data and isinstance(data['task'], str):
-            task_instruction = data['task']
-        
+        # Convert 4D quaternion to 3D axis-angle representation
+        # The training data was created with a 3D axis-angle representation for orientation.
+        ee_ori_axis_angle = quat_to_axis_angle(ee_ori_quat)
+
+        # Concatenate to form the 15D observation state, now with correct components
+        obs_state = torch.cat([ee_pos, ee_ori_axis_angle, gripper_states, joint_states], dim=-1)
+
+        # Image normalization
+        agentview_rgb, eye_in_hand_rgb = agentview_rgb.float(), eye_in_hand_rgb.float()
+        if agentview_rgb.max() > 1.0: agentview_rgb /= 255.0
+        if eye_in_hand_rgb.max() > 1.0: eye_in_hand_rgb /= 255.0
+        agentview_rgb = agentview_rgb * 2.0 - 1.0
+        eye_in_hand_rgb = eye_in_hand_rgb * 2.0 - 1.0
+
+        # Task instruction
+        task_instruction = self.current_task_instruction
+        if task_instruction is None:
+            if isinstance(data, dict) and 'task_str' in data:
+                task_instruction = data['task_str']
+            elif isinstance(data, dict) and 'task' in data and isinstance(data['task'], str):
+                task_instruction = data['task']
+            else:
+                task_instruction = "Complete the task"
+                print("WARNING: No task instruction found, using generic fallback")
+
         return {
             "observation.state": obs_state,
             "observation.images.top": agentview_rgb,
             "observation.images.wrist": eye_in_hand_rgb,
             "task": task_instruction
         }
-    
+
     def get_action(self, data):
         """
         Get action from the SmolVLA policy in LIBERO format.
@@ -155,20 +180,25 @@ class LerobotSmolVLAPolicy(BasePolicy):
         with torch.no_grad():
             # Convert LIBERO format to Lerobot format
             lerobot_obs = self._convert_libero_to_lerobot_obs(data)
-            
+
             # Get action from SmolVLA policy
             action_tensor = self.smolvla_policy.select_action(lerobot_obs)
             
             # Convert to numpy for LIBERO
             action_np = action_tensor.detach().cpu().numpy()
             
-            # Ensure proper shape for LIBERO (B, 7)
+            # Ensure proper shape for LIBERO
             if action_np.ndim == 1:
+                # If 1D tensor of shape (7,), reshape to (1, 7)
                 action_np = action_np.reshape(1, -1)
-            
-            # SmolVLA outputs actions for the full chunk, but we only need the first action
-            # Take only the first 7 dimensions (position + orientation + gripper)
-            action_np = action_np[:, :7]
+            elif action_np.ndim == 2:
+                # SmolVLA outputs actions with shape (batch_size, action_dim)
+                # LIBERO expects (batch_size, 7) for Panda robot
+                if action_np.shape[1] > 7:
+                    # Only slice if there are more than 7 dimensions
+                    action_np = action_np[:, :7]
+            else:
+                raise ValueError(f"Unexpected action shape: {action_np.shape}")
                 
             return action_np
     

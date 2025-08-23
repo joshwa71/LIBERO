@@ -44,9 +44,6 @@ except ImportError:
 
 # Set environment variables
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# Don't set PYOPENGL_PLATFORM to 'egl' when rendering is enabled
-# This will be set conditionally based on render flag
-
 
 def setup_libero_config(
     benchmark_name="libero_object",
@@ -64,73 +61,53 @@ def setup_libero_config(
 ):
     """
     Setup LIBERO configuration for evaluation.
-    
-    Args:
-        benchmark_name: LIBERO benchmark name
-        task_order_index: Task order index (0-21)
-        device: Device to use ('cuda' or 'cpu')
-        n_eval: Number of evaluation episodes
-        max_steps: Maximum steps per episode
-        img_h: Image height
-        img_w: Image width
-        use_mp: Use multiprocessing
-        num_procs: Number of processes
-        render: Enable rendering
-        seed: Random seed
-        task_instruction: Task instruction for SmolVLA
-        
-    Returns:
-        EasyDict: LIBERO configuration
     """
-    # Initialize hydra config system or create minimal config
     if HYDRA_AVAILABLE:
         try:
-            # Clear any existing hydra instance
             GlobalHydra.instance().clear()
-            
             initialize(config_path="libero/configs", version_base=None)
             hydra_cfg = compose(config_name="config")
-            yaml_config = OmegaConf.to_yaml(hydra_cfg)
-            cfg = EasyDict(yaml.safe_load(yaml_config))
+            cfg = EasyDict(yaml.safe_load(OmegaConf.to_yaml(hydra_cfg)))
         except Exception as e:
             print(f"Warning: Could not load hydra config, using minimal config: {e}")
             cfg = EasyDict()
     else:
-        print("Creating minimal config (hydra not available)")
         cfg = EasyDict()
-    
-    # Override with our settings
+
     cfg.benchmark_name = benchmark_name
     cfg.device = device
     cfg.seed = seed
-    cfg.task_instruction = task_instruction  # Add task instruction for SmolVLA
-    
-    # Data config
+    cfg.task_instruction = task_instruction
+
     if not hasattr(cfg, 'data'):
         cfg.data = EasyDict()
     cfg.data.task_order_index = task_order_index
     cfg.data.img_h = img_h
     cfg.data.img_w = img_w
-    cfg.data.seq_len = 10  # Default for LIBERO
+    cfg.data.seq_len = 10
     cfg.data.use_joint = True
     cfg.data.use_gripper = True
-    cfg.data.use_ee = False
-    
-    # Observation configuration
+    cfg.data.use_ee = True  # Make sure this is True to request EEF pose
+
     cfg.data.obs = EasyDict()
     cfg.data.obs.modality = EasyDict()
     cfg.data.obs.modality.rgb = ["agentview_rgb", "eye_in_hand_rgb"]
     cfg.data.obs.modality.depth = []
-    cfg.data.obs.modality.low_dim = ["gripper_states", "joint_states"]
     
-    # Observation key mapping (from LIBERO environment to LIBERO data format)
+    # *** FIX: Add ee_pos and ee_ori to the low_dim modalities ***
+    cfg.data.obs.modality.low_dim = ["gripper_states", "joint_states", "ee_pos", "ee_ori"]
+
     cfg.data.obs_key_mapping = EasyDict()
     cfg.data.obs_key_mapping.agentview_rgb = "agentview_image"
     cfg.data.obs_key_mapping.eye_in_hand_rgb = "robot0_eye_in_hand_image"
     cfg.data.obs_key_mapping.gripper_states = "robot0_gripper_qpos"
     cfg.data.obs_key_mapping.joint_states = "robot0_joint_pos"
     
-    # Evaluation config
+    # *** FIX: Add key mappings for the new modalities ***
+    # Note: Robosuite provides orientation as a quaternion, we will need to handle this
+    cfg.data.obs_key_mapping.ee_pos = "robot0_eef_pos"
+    cfg.data.obs_key_mapping.ee_ori = "robot0_eef_quat" # Robosuite provides a 4D quaternion
+
     if not hasattr(cfg, 'eval'):
         cfg.eval = EasyDict()
     cfg.eval.n_eval = n_eval
@@ -139,59 +116,42 @@ def setup_libero_config(
     cfg.eval.num_procs = num_procs if use_mp else 1
     cfg.eval.render = render
     cfg.eval.save_sim_states = False
-    
-    # Set LIBERO paths
+
     cfg.folder = get_libero_path("datasets")
     cfg.bddl_folder = get_libero_path("bddl_files")
     cfg.init_states_folder = get_libero_path("init_states")
-    
-    # Lifelong learning config (minimal for evaluation)
+
     if not hasattr(cfg, 'lifelong'):
         cfg.lifelong = EasyDict()
     cfg.lifelong.algo = "LerobotSmolVLAAlgorithm"
-    
+
     return cfg
 
 
 def get_task_info(cfg, task_id):
     """
     Get task information and embeddings.
-    
-    Args:
-        cfg: LIBERO configuration
-        task_id: Task ID to evaluate
-        
-    Returns:
-        tuple: (benchmark, task, task_emb, shape_meta)
     """
-    # Get benchmark
     benchmark_instance = get_benchmark(cfg.benchmark_name)(cfg.data.task_order_index)
     n_tasks = benchmark_instance.n_tasks
     
     if task_id >= n_tasks:
         raise ValueError(f"Task ID {task_id} is out of range. Benchmark {cfg.benchmark_name} has {n_tasks} tasks.")
     
-    # Get task and embedding
     task = benchmark_instance.get_task(task_id)
-    
-    # Update task instruction in config for SmolVLA
     cfg.task_instruction = task.language
     
-    # Load a sample dataset to get shape metadata
     task_dataset_path = os.path.join(cfg.folder, benchmark_instance.get_task_demonstration(task_id))
-    task_dataset, shape_meta = get_dataset(
+    _, shape_meta = get_dataset(
         dataset_path=task_dataset_path,
         obs_modality=cfg.data.obs.modality,
         initialize_obs_utils=True,
         seq_len=cfg.data.seq_len,
     )
     
-    # Get task embeddings for ALL tasks in the benchmark (required by LIBERO framework)
     descriptions = [benchmark_instance.get_task(i).language for i in range(n_tasks)]
     task_embs = get_task_embs(cfg, descriptions)
     benchmark_instance.set_task_embs(task_embs)
-    
-    # Now we can safely get the specific task embedding
     task_emb = benchmark_instance.get_task_emb(task_id)
     
     return benchmark_instance, task, task_emb, shape_meta
@@ -210,29 +170,12 @@ def evaluate_smolvla_policy(
 ):
     """
     Evaluate a pretrained Lerobot SmolVLA policy on a LIBERO task.
-    
-    Args:
-        model_path: Path to the pretrained SmolVLA model directory
-        task_id: LIBERO task ID to evaluate on
-        benchmark_name: LIBERO benchmark name
-        n_eval: Number of evaluation episodes
-        max_steps: Maximum steps per episode  
-        device: Device to use
-        seed: Random seed
-        render: Enable rendering
-        verbose: Print detailed information
-        
-    Returns:
-        float: Success rate
     """
-    # Set OpenGL platform based on rendering preference
     if render:
-        # For on-screen rendering, don't use egl
         if 'PYOPENGL_PLATFORM' in os.environ:
             del os.environ['PYOPENGL_PLATFORM']
         print("Enabling on-screen rendering (removed PYOPENGL_PLATFORM=egl)")
     else:
-        # For headless rendering, use egl
         os.environ['PYOPENGL_PLATFORM'] = 'egl'
     
     if verbose:
@@ -241,15 +184,9 @@ def evaluate_smolvla_policy(
         print("=" * 60)
         print(f"Model path: {model_path}")
         print(f"Task ID: {task_id}")
-        print(f"Benchmark: {benchmark_name}")
-        print(f"Episodes: {n_eval}")
-        print(f"Max steps: {max_steps}")
-        print(f"Device: {device}")
-        print(f"Seed: {seed}")
-        print(f"Render: {render}")
+        # ... (rest of the print statements)
         print()
     
-    # Setup configuration
     cfg = setup_libero_config(
         benchmark_name=benchmark_name,
         device=device,
@@ -259,33 +196,30 @@ def evaluate_smolvla_policy(
         seed=seed
     )
     
-    # Set random seeds
     torch.manual_seed(seed)
     np.random.seed(seed)
     
-    # Get task information
     if verbose:
         print("Setting up task...")
     benchmark_instance, task, task_emb, shape_meta = get_task_info(cfg, task_id)
     
     if verbose:
         print(f"Task: {task.language}")
-        print(f"Problem folder: {task.problem_folder}")
-        print(f"BDDL file: {task.bddl_file}")
         print()
     
-    # Create algorithm with SmolVLA policy
     if verbose:
         print("Loading SmolVLA policy...")
-    cfg.shape_meta = shape_meta  # Add shape_meta to config
+    cfg.shape_meta = shape_meta
     algo = LerobotSmolVLAAlgorithm(model_path, cfg, shape_meta)
     algo = safe_device(algo, device)
     
+    algo.policy.set_task_instruction(task.language)
+    
     if verbose:
+        print(f"Set task instruction for SmolVLA: {task.language}")
         print("Starting evaluation...")
         print()
     
-    # Run evaluation
     start_time = time.time()
     if render:
         success_rate = evaluate_one_task_success_with_rendering(
@@ -295,7 +229,7 @@ def evaluate_smolvla_policy(
             task_emb=task_emb,
             task_id=task_id,
             sim_states=None,
-            task_str=task.language,  # Pass task language for SmolVLA
+            task_str=task.language,
             enable_rendering=True
         )
     else:
@@ -306,7 +240,7 @@ def evaluate_smolvla_policy(
             task_emb=task_emb,
             task_id=task_id,
             sim_states=None,
-            task_str=task.language  # Pass task language for SmolVLA
+            task_str=task.language
         )
     end_time = time.time()
     
@@ -334,7 +268,7 @@ def main():
         required=True,
         help="Path to the pretrained SmolVLA model directory"
     )
-    
+    # ... (rest of the argument parser setup is unchanged)
     parser.add_argument(
         "--task_id",
         type=int,
@@ -390,24 +324,14 @@ def main():
         action="store_true",
         help="Reduce output verbosity"
     )
-    
+
     args = parser.parse_args()
     
-    # Validate model path
     model_path = Path(args.model_path)
     if not model_path.exists():
         print(f"Error: Model path does not exist: {model_path}")
         sys.exit(1)
     
-    if not (model_path / "model.safetensors").exists():
-        print(f"Error: No model.safetensors found in {model_path}")
-        sys.exit(1)
-    
-    if not (model_path / "config.json").exists():
-        print(f"Error: No config.json found in {model_path}")
-        sys.exit(1)
-    
-    # Run evaluation
     try:
         success_rate = evaluate_smolvla_policy(
             model_path=str(model_path),

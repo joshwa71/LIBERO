@@ -61,7 +61,7 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
 
 class SmolVLMWithExpertModel(nn.Module):
     """SmolVLM with expert model adapted for LIBERO environment."""
-    
+        
     def __init__(
         self,
         model_id: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
@@ -79,17 +79,17 @@ class SmolVLMWithExpertModel(nn.Module):
         # Load the VLM model and config
         if load_vlm_weights:
             print(f"Loading {model_id} weights ...")
+            # FIX: Don't use device_map="auto" and use float32 for inference
             self.vlm = AutoModelForImageTextToText.from_pretrained(
                 model_id,
-                device_map="auto",
-                torch_dtype="bfloat16" if torch.cuda.is_available() else "float32",
+                device_map=None,  # <-- FIX: Don't auto-distribute
+                torch_dtype=torch.float32,  # <-- FIX: Use float32 for compatibility
                 low_cpu_mem_usage=True,
             )
             config = self.vlm.config
         else:
             config = AutoConfig.from_pretrained(model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
-            
         self.processor = AutoProcessor.from_pretrained(model_id)
         
         # Adjust number of VLM layers if specified
@@ -203,23 +203,308 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: bool = None,
         fill_kv_cache: bool = None,
     ):
-        """Forward pass through the model."""
-        # Simplified forward pass for LIBERO compatibility
-        # This is a minimal implementation that handles the basic case
+        """Forward pass through the model with proper attention mechanisms."""
+        models = [self.get_vlm_model().text_model, self.lm_expert]
+        model_layers = self.get_model_layers(models)
         
-        outputs_embeds = []
-        
+        # Get batch size from non-None hidden states
+        batch_size = None
         for hidden_states in inputs_embeds:
             if hidden_states is not None:
-                # Simple pass through for now
-                # In a full implementation, this would involve complex attention mechanisms
-                outputs_embeds.append(hidden_states)
+                batch_size = hidden_states.shape[0]
+                break
+        
+        if batch_size is None:
+            return inputs_embeds, past_key_values
+        
+        # Process through layers
+        num_layers = self.num_vlm_layers
+        head_dim = self.config.text_config.head_dim
+        
+        for layer_idx in range(num_layers):
+            if (
+                fill_kv_cache
+                or "cross" not in self.attention_mode
+                or (self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0)
+            ):
+                att_outputs, past_key_values = self.forward_attn_layer(
+                    model_layers,
+                    inputs_embeds,
+                    layer_idx,
+                    position_ids,
+                    attention_mask,
+                    batch_size,
+                    head_dim,
+                    use_cache=use_cache,
+                    fill_kv_cache=fill_kv_cache,
+                    past_key_values=past_key_values,
+                )
+            else:
+                att_outputs, past_key_values = self.forward_cross_attn_layer(
+                    model_layers,
+                    inputs_embeds,
+                    layer_idx,
+                    position_ids,
+                    attention_mask,
+                    batch_size,
+                    head_dim,
+                    use_cache=use_cache,
+                    fill_kv_cache=fill_kv_cache,
+                    past_key_values=past_key_values,
+                )
+            
+            outputs_embeds = []
+            start = 0
+            for i, hidden_states in enumerate(inputs_embeds):
+                layer = model_layers[i][layer_idx]
+                att_output = (
+                    att_outputs[i] if i < len(att_outputs) else att_outputs[0]
+                )  # in case of self_attn
+                
+                if hidden_states is not None:
+                    if layer is None:
+                        outputs_embeds.append(hidden_states)
+                        continue
+                    
+                    end = start + hidden_states.shape[1]
+                    
+                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                    att_out = att_output[:, start:end]
+                    out_emb = layer.self_attn.o_proj(att_out)
+                    
+                    out_emb += hidden_states
+                    after_first_residual = out_emb.clone()
+                    
+                    out_emb = layer.post_attention_layernorm(out_emb)
+                    out_emb = layer.mlp(out_emb)
+                    
+                    out_emb += after_first_residual
+                    
+                    outputs_embeds.append(out_emb)
+                    
+                    start = end if len(att_outputs) == 1 else 0
+                else:
+                    outputs_embeds.append(None)
+            
+            inputs_embeds = outputs_embeds
+        
+        # Final norm
+        outputs_embeds = []
+        for i, hidden_states in enumerate(inputs_embeds):
+            if hidden_states is not None:
+                out_emb = models[i].norm(hidden_states)
+                outputs_embeds.append(out_emb)
             else:
                 outputs_embeds.append(None)
         
-        # Return simplified outputs
         return outputs_embeds, past_key_values
 
+    def get_model_layers(self, models: List) -> List:
+        """Get model layers for VLM and expert."""
+        vlm_layers = []
+        expert_layers = []
+        multiple_of = self.num_vlm_layers // self.num_expert_layers if self.num_expert_layers > 0 else 0
+        
+        for i in range(self.num_vlm_layers):
+            if multiple_of > 0 and i > 0 and i % multiple_of != 0:
+                expert_layer = None
+            else:
+                expert_layer_index = i // multiple_of if multiple_of > 0 else i
+                if expert_layer_index < len(self.lm_expert.layers):
+                    expert_layer = self.lm_expert.layers[expert_layer_index]
+                else:
+                    expert_layer = None
+            vlm_layers.append(models[0].layers[i])
+            expert_layers.append(expert_layer)
+        
+        return [vlm_layers, expert_layers]
+    
+    def forward_attn_layer(
+        self,
+        model_layers,
+        inputs_embeds,
+        layer_idx,
+        position_ids,
+        attention_mask,
+        batch_size,
+        head_dim,
+        use_cache: bool = True,
+        fill_kv_cache: bool = True,
+        past_key_values=None,
+    ) -> List[torch.Tensor]:
+        """Forward pass through attention layer."""
+        query_states = []
+        key_states = []
+        value_states = []
+        
+        for i, hidden_states in enumerate(inputs_embeds):
+            layer = model_layers[i][layer_idx]
+            if hidden_states is None or layer is None:
+                continue
+            
+            hidden_states = layer.input_layernorm(hidden_states)
+            
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+            
+            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
+            query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
+            key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
+            value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
+            
+            query_states.append(query_state)
+            key_states.append(key_state)
+            value_states.append(value_state)
+        
+        # Concatenate on the number of embeddings/tokens
+        query_states = torch.cat(query_states, dim=1)
+        key_states = torch.cat(key_states, dim=1)
+        value_states = torch.cat(value_states, dim=1)
+        seq_len = query_states.shape[1]
+        
+        if seq_len < position_ids.shape[1]:
+            _position_ids = position_ids[:, :seq_len]
+            _attention_mask = attention_mask[:, :seq_len, :seq_len]
+        else:
+            _position_ids = position_ids
+            _attention_mask = attention_mask
+        
+        query_states = apply_rope(query_states, _position_ids)
+        key_states = apply_rope(key_states, _position_ids)
+        
+        if use_cache and past_key_values is None:
+            past_key_values = {}
+        
+        if use_cache:
+            if fill_kv_cache:
+                past_key_values[layer_idx] = {
+                    "key_states": key_states,
+                    "value_states": value_states,
+                }
+            else:
+                # Concatenate with cached key/value states
+                key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
+                value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
+        
+        attention_interface = self.get_attention_interface()
+        
+        att_output = attention_interface(
+            _attention_mask, batch_size, head_dim, query_states, key_states, value_states
+        )
+        return [att_output], past_key_values
+    
+    def forward_cross_attn_layer(
+        self,
+        model_layers,
+        inputs_embeds,
+        layer_idx,
+        position_ids,
+        attention_mask,
+        batch_size,
+        head_dim,
+        use_cache: bool = True,
+        fill_kv_cache: bool = True,
+        past_key_values=None,
+    ) -> List[torch.Tensor]:
+        """Forward pass through cross attention layer."""
+        attention_interface = self.get_attention_interface()
+        att_outputs = []
+        
+        assert len(inputs_embeds) == 2 or (use_cache and past_key_values is not None and not fill_kv_cache), (
+            f"Both len(inputs_embeds) == {len(inputs_embeds)} and past_key_values is {past_key_values}"
+        )
+        
+        if len(inputs_embeds) == 2 and not past_key_values:
+            # Prefix attention
+            seq_len = inputs_embeds[0].shape[1]
+            position_id, expert_position_id = position_ids[:, :seq_len], position_ids[:, seq_len:]
+            prefix_attention_mask = attention_mask[:, :seq_len, :seq_len]
+            
+            layer = model_layers[0][layer_idx]
+            
+            hidden_states = layer.input_layernorm(inputs_embeds[0])
+            
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+            
+            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
+            query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
+            key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
+            value_states = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
+            
+            # Apply RoPE
+            query_states = apply_rope(query_state, position_id)
+            key_states = apply_rope(key_state, position_id)
+            
+            att_output = attention_interface(
+                prefix_attention_mask, batch_size, head_dim, query_states, key_states, value_states
+            )
+            att_outputs.append(att_output)
+        else:
+            expert_position_id = position_ids
+        
+        if use_cache and past_key_values is None:
+            past_key_values = {}
+        
+        if use_cache:
+            if fill_kv_cache:
+                past_key_values[layer_idx] = {
+                    "key_states": key_states,
+                    "value_states": value_states,
+                }
+            else:
+                key_states = past_key_values[layer_idx]["key_states"]
+                value_states = past_key_values[layer_idx]["value_states"]
+        
+        # Expert
+        expert_layer = model_layers[1][layer_idx]
+        if expert_layer is not None:
+            expert_hidden_states = expert_layer.input_layernorm(inputs_embeds[1])
+            
+            expert_input_shape = expert_hidden_states.shape[:-1]
+            expert_hidden_shape = (*expert_input_shape, -1, expert_layer.self_attn.head_dim)
+            
+            expert_hidden_states = expert_hidden_states.to(dtype=expert_layer.self_attn.q_proj.weight.dtype)
+            expert_query_state = expert_layer.self_attn.q_proj(expert_hidden_states).view(expert_hidden_shape)
+            
+            _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).view(
+                *key_states.shape[:2], -1
+            )
+            expert_key_states = expert_layer.self_attn.k_proj(_key_states).view(
+                *_key_states.shape[:-1], -1, expert_layer.self_attn.head_dim
+            )
+            
+            _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
+                *value_states.shape[:2], -1
+            )
+            expert_value_states = expert_layer.self_attn.v_proj(_value_states).view(
+                *_value_states.shape[:-1], -1, expert_layer.self_attn.head_dim
+            )
+            
+            expert_position_id = (
+                expert_position_id - torch.min(expert_position_id, dim=1, keepdim=True).values
+            )  # start from 0
+            expert_attention_mask = attention_mask[
+                :, -inputs_embeds[1].shape[1] :, : expert_key_states.shape[1] :
+            ]  # take into account kv
+            
+            expert_query_states = apply_rope(expert_query_state, expert_position_id)
+            
+            att_output = attention_interface(
+                expert_attention_mask,
+                batch_size,
+                head_dim,
+                expert_query_states,
+                expert_key_states,
+                expert_value_states,
+            )
+            att_outputs.append(att_output)
+        else:
+            att_outputs.append(None)
+        
+        return att_outputs, past_key_values
+    
     def get_attention_interface(self):
         """Get attention interface."""
         return self.eager_attention_forward

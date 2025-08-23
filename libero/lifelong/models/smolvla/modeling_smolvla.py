@@ -43,47 +43,10 @@ from .normalize import Normalize, Unnormalize
 from .types import FeatureType, PolicyFeature
 from .smolvlm_with_expert import SmolVLMWithExpertModel
 
-# Matches ".soNNN", optionally followed by "-something", up to the "_buffer_" marker
-_VARIANT_RE = re.compile(r"\.so\d+(?:-[\w]+)?_buffer_")
-
-
-def canonicalise(k: str) -> str:
-    """
-    Remove dataset-variant markers like '.so100-blue_' or '.so100_' from a
-    normalisation-buffer key.
-    """
-    return _VARIANT_RE.sub(".buffer_", k)
-
-
-def standardise_state_dict(
-    checkpoint: Dict[str, torch.Tensor], ref_keys: set, *, verbose: bool = True
-) -> Tuple[Dict[str, torch.Tensor], list]:
-    """
-    • Re-keys `checkpoint ` so that every entry matches the *reference* key set.
-    • If several variant keys collapse to the same canonical name we keep the
-      first one and log the collision.
-    • Returns the new dict + a list of entries that could not be matched.
-    """
-    out, collisions, unmatched = {}, {}, []
-
-    for k, v in checkpoint.items():
-        canon = canonicalise(k)
-        if canon in ref_keys:
-            if canon in out:  # duplicate after collapsing
-                collisions.setdefault(canon, []).append(k)
-            else:
-                out[canon] = v
-        else:
-            unmatched.append(k)
-
-    if verbose:
-        for canon, variants in collisions.items():
-            print(f"[standardise_state_dict] '{canon}'  ←  {variants}")
-        if unmatched:
-            print(f"[standardise_state_dict] kept {len(unmatched)} unmatched keys")
-
-    out.update({k: checkpoint[k] for k in unmatched})
-    return out, unmatched
+# Note: Removed standardise_state_dict and canonicalise functions
+# These were causing issues with normalization key loading in LIBERO
+# LIBERO needs to load normalization stats from the model checkpoint directly
+# unlike Lerobot which expects them from the dataset
 
 
 def rename_checkpoint_keys(checkpoint: Dict, rename_str: str):
@@ -187,19 +150,19 @@ def pad_vector(vector, new_dim):
 def pad_tensor(tensor, max_len, pad_value=0):
     """Pad tensor along sequence dimension to max_len."""
     b, d = tensor.shape[:2]
-    
+
     padded_tensor = torch.full(
         (b, max_len, *tensor.shape[2:]), pad_value, dtype=tensor.dtype, device=tensor.device
     )
     padded_tensor[:, :d] = tensor
-    
+
     return padded_tensor
 
 
 class SmolVLAPolicy(nn.Module):
     """
     SmolVLA Policy adapted for LIBERO environment.
-    
+
     Simplified version of Lerobot's SmolVLAPolicy that can be loaded and used
     within LIBERO without external Lerobot dependencies.
     """
@@ -243,7 +206,7 @@ class SmolVLAPolicy(nn.Module):
         """Select a single action given environment observations."""
         self.eval()
         batch = self._prepare_batch(batch)
-        
+
         # Action queue logic for n_action_steps > 1
         if len(self._queues[ACTION]) == 0:
             actions = self._get_action_chunk(batch, noise)
@@ -354,7 +317,7 @@ class SmolVLAPolicy(nn.Module):
         state = self.prepare_state(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
         actions = self.prepare_action(batch)
-        
+
         loss_dict = {}
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
         loss_dict["losses_after_forward"] = losses.clone()
@@ -367,85 +330,58 @@ class SmolVLAPolicy(nn.Module):
         loss = losses.mean()
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
-
     @classmethod
     def from_pretrained(cls, pretrained_path: Union[str, Path]) -> "SmolVLAPolicy":
         """Load a pretrained SmolVLA policy from a directory containing model files."""
         pretrained_path = Path(pretrained_path)
-        
+
         # Load config
         config_file = pretrained_path / "config.json"
         if not config_file.exists():
             raise FileNotFoundError(f"Config file not found: {config_file}")
-        
+
         config = SmolVLAConfig.from_json_file(config_file)
-        
+
         # Create policy instance (without dataset_stats - they're in the state_dict)
         policy = cls(config, dataset_stats=None)
-        
+
         # Load model weights
         model_file = pretrained_path / "model.safetensors"
         if not model_file.exists():
             raise FileNotFoundError(f"Model file not found: {model_file}")
-        
-        # Load state dict from safetensors
-        state_dict = safetensors.torch.load_file(str(model_file), device=config.device)
-        
-        # Standardize state dict but preserve normalization keys
-        policy_keys = set(policy.state_dict().keys())
-        norm_keys_in_state = {k: v for k, v in state_dict.items() if any(norm in k for norm in ["normalize_inputs", "normalize_targets", "unnormalize_outputs"])}
-        
-        # Standardize non-normalization keys
-        non_norm_state = {k: v for k, v in state_dict.items() if not any(norm in k for norm in ["normalize_inputs", "normalize_targets", "unnormalize_outputs"])}
-        standardized_state, unmatched = standardise_state_dict(non_norm_state, policy_keys)
-        
-        # Add back normalization keys without standardization
-        state_dict = {**standardized_state, **norm_keys_in_state}
-        
-        # Keep normalization keys - they should be loaded from the trained model
-        # norm_keys = ("normalize_inputs", "normalize_targets", "unnormalize_outputs")
-        # state_dict = {k: v for k, v in state_dict.items() if not k.startswith(norm_keys)}
-        
+
+        # Load state dict from safetensors - load to CPU first
+        state_dict = safetensors.torch.load_file(str(model_file), device="cpu")
+
         # Load the state dict
         missing_keys, unexpected_keys = policy.load_state_dict(state_dict, strict=False)
-        
-        # Debug the loading
-        print(f"Missing keys: {len(missing_keys)} keys")
-        print(f"Unexpected keys: {len(unexpected_keys)} keys")
-        
-        # Check for normalization parameters specifically
-        norm_missing = [key for key in missing_keys if any(norm in key for norm in ["normalize_inputs", "normalize_targets", "unnormalize_outputs"])]
-        if norm_missing:
-            print(f"WARNING: Missing normalization keys: {norm_missing[:5]}...")  # Show first 5
-            
-        # Also check what normalization keys were loaded
-        norm_loaded = [key for key in state_dict.keys() if any(norm in key for norm in ["normalize_inputs", "normalize_targets", "unnormalize_outputs"])]
-        if norm_loaded:
-            print(f"Loaded normalization keys: {norm_loaded[:5]}...")  # Show first 5
-        else:
-            print("WARNING: No normalization keys found in state_dict!")
-            
-        # Check if we have any buffer keys
-        buffer_keys = [key for key in state_dict.keys() if "buffer_" in key]
-        if buffer_keys:
-            print(f"Buffer keys found: {buffer_keys[:5]}...")  # Show first 5
-        
+
+        # Report missing/unexpected keys for debugging
+        if missing_keys:
+            important_missing = [k for k in missing_keys if not k.startswith("_")]
+            if important_missing:
+                print(f"Warning: Missing keys when loading model: {len(important_missing)} keys")
+                if len(important_missing) <= 5:
+                    print(f"  Missing: {important_missing}")
+                else:
+                    print(f"  First 5 missing: {important_missing[:5]}")
+
+        if unexpected_keys:
+            print(f"Warning: Unexpected keys when loading model: {len(unexpected_keys)} keys")
+            if len(unexpected_keys) <= 5:
+                print(f"  Unexpected: {unexpected_keys}")
+            else:
+                print(f"  First 5 unexpected: {unexpected_keys[:5]}")
+
+        # Move entire model to device AFTER loading
         policy.to(config.device)
+
+        # Ensure VLM is also on the correct device (important!)
+        if hasattr(policy.model, 'vlm_with_expert') and hasattr(policy.model.vlm_with_expert, 'vlm'):
+            policy.model.vlm_with_expert.vlm.to(config.device)
+
         policy.eval()
-        
-        # Debug normalization stats after loading
-        for name, module in policy.named_modules():
-            if hasattr(module, 'features') and 'normalize' in name:
-                for feature_name in module.features:
-                    buffer_name = "buffer_" + feature_name.replace(".", "_")
-                    if hasattr(module, buffer_name):
-                        buffer = getattr(module, buffer_name)
-                        if hasattr(buffer, 'mean'):
-                            mean_val = buffer.mean.data
-                            print(f"{name}.{buffer_name}.mean: min={mean_val.min():.4f}, max={mean_val.max():.4f}, isinf={torch.isinf(mean_val).any()}")
-                            if torch.isinf(mean_val).any():
-                                print(f"  ERROR: Infinity values in {name}.{buffer_name}.mean!")
-        
+
         return policy
 
 
@@ -453,12 +389,11 @@ class VLAFlowMatching(nn.Module):
     """
     SmolVLA Flow Matching model adapted for LIBERO.
     """
-
     def __init__(self, config: SmolVLAConfig):
         super().__init__()
         self.config = config
 
-        # Initialize the VLM with expert model
+        # Initialize the VLM with expert model with corrected settings
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
             freeze_vision_encoder=self.config.freeze_vision_encoder,
@@ -471,6 +406,9 @@ class VLAFlowMatching(nn.Module):
             expert_width_multiplier=self.config.expert_width_multiplier,
         )
 
+        # Ensure VLM is in float32 and eval mode for inference
+        self.vlm_with_expert.vlm = self.vlm_with_expert.vlm.float()
+        self.vlm_with_expert.vlm.eval()
         # State and action projections
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
@@ -523,7 +461,7 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None) -> Tensor:
-        """Sample actions using flow matching."""
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = state.shape[0]
         device = state.device
 
@@ -531,38 +469,72 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        # For inference, we use a simplified approach
-        # In a full implementation, this would use the flow matching sampling process
-        # Here we use a single denoising step for simplicity
-        time = torch.tensor(0.5, dtype=torch.float32, device=device).expand(bsize)
-        
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        
-        # Simple action sampling - in full implementation this would be iterative
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(noise, time)
-        
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-        
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
-            attention_mask=att_2d_masks,
-            position_ids=position_ids,
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        # Compute image and language key value cache
+        _, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
-            use_cache=False,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+        dt = -1.0 / self.config.num_steps
+        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        while time >= -dt / 2:
+            expanded_time = time.expand(bsize)
+            v_t = self.denoise_step(
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                expanded_time,
+            )
+            # Euler step
+            x_t += dt * v_t
+            time += dt
+        return x_t
+
+    def denoise_step(
+        self,
+        prefix_pad_masks,
+        past_key_values,
+        x_t,
+        timestep,
+    ):
+        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        outputs_embeds, _ = self.vlm_with_expert.forward(
+            attention_mask=full_att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=self.config.use_cache,
             fill_kv_cache=False,
         )
-        
+        suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        actions = self.action_out_proj(suffix_out)
-        
-        return actions
+        v_t = self.action_out_proj(suffix_out)
+        return v_t
 
     def embed_prefix(self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None):
         """Embed prefix (images, language, state) for processing."""
@@ -588,7 +560,7 @@ class VLAFlowMatching(nn.Module):
                 pad_masks.append(image_start_mask)
 
             img_emb = self.vlm_with_expert.embed_image(img)
-            
+
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
             img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
