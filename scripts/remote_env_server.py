@@ -87,25 +87,62 @@ class LiberoRemoteServer:
         # Expected keys from LIBERO env: agentview_image, robot0_eye_in_hand_image, robot0_eef_pos, etc.
         pixels = {}
         if "agentview_image" in obs:
-            # Rename LIBERO's agentview to head for downstream clients
+            # Use 'head' to match trained policy configs
             pixels["head"] = _encode_ndarray(obs["agentview_image"].astype(np.uint8, copy=False))
         if "robot0_eye_in_hand_image" in obs:
             pixels["wrist"] = _encode_ndarray(obs["robot0_eye_in_hand_image"].astype(np.uint8, copy=False))
 
-        # Build a compact state: joint + gripper + eef (if available)
+        # Build a compact state in the order used during training:
+        # [ee_pos(3), ee_ori_axis_angle(3), gripper(2), joints(7)] => 15 dims
         state_vecs = []
-        if "robot0_joint_pos" in obs:
-            state_vecs.append(obs["robot0_joint_pos"].astype(np.float32, copy=False).reshape(-1))
-        if "robot0_gripper_qpos" in obs:
-            state_vecs.append(obs["robot0_gripper_qpos"].astype(np.float32, copy=False).reshape(-1))
+        # 1) End-effector position
         if "robot0_eef_pos" in obs:
             state_vecs.append(obs["robot0_eef_pos"].astype(np.float32, copy=False).reshape(-1))
-        state = np.concatenate(state_vecs, axis=0) if state_vecs else np.zeros((18,), dtype=np.float32)
+        else:
+            state_vecs.append(np.zeros((3,), dtype=np.float32))
+        # 2) End-effector orientation (axis-angle)
+        if "robot0_eef_quat" in obs:
+            q = obs["robot0_eef_quat"].astype(np.float32, copy=False).reshape(-1)
+            # Robustly convert quaternion to axis-angle.
+            # Robosuite typically uses XYZW ordering; assume (x, y, z, w) and normalize.
+            if q.shape[0] == 4:
+                x, y, z, w = q[0], q[1], q[2], q[3]
+                norm = max(1e-8, float(np.sqrt(w * w + x * x + y * y + z * z)))
+                w, x, y, z = w / norm, x / norm, y / norm, z / norm
+                angle = 2.0 * float(np.arccos(np.clip(w, -1.0, 1.0)))
+                s = float(np.sqrt(max(1e-8, 1.0 - w * w)))
+                if s > 1e-6:
+                    axis = np.array([x / s, y / s, z / s], dtype=np.float32)
+                else:
+                    axis = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                axis_angle = axis * angle
+                state_vecs.append(axis_angle.astype(np.float32, copy=False).reshape(-1))
+            else:
+                state_vecs.append(np.zeros((3,), dtype=np.float32))
+        else:
+            state_vecs.append(np.zeros((3,), dtype=np.float32))
+        # 3) Gripper
+        if "robot0_gripper_qpos" in obs:
+            state_vecs.append(obs["robot0_gripper_qpos"].astype(np.float32, copy=False).reshape(-1))
+        else:
+            state_vecs.append(np.zeros((2,), dtype=np.float32))
+        # 4) Joints
+        if "robot0_joint_pos" in obs:
+            state_vecs.append(obs["robot0_joint_pos"].astype(np.float32, copy=False).reshape(-1))
+        else:
+            state_vecs.append(np.zeros((7,), dtype=np.float32))
+
+        # Compose and force exactly 15 dims
+        state = np.concatenate(state_vecs, axis=0) if state_vecs else np.zeros((15,), dtype=np.float32)
+        if state.size < 15:
+            state = np.concatenate([state, np.zeros((15 - state.size,), dtype=np.float32)], axis=0)
+        elif state.size > 15:
+            state = state[:15]
 
         return {"pixels": pixels, "agent_pos": _encode_ndarray(state)}
 
     def _spec_message(self) -> Dict[str, Any]:
-        # Assume 4-dim action: 3 deltas + gripper (close/stay/open mapped to 0..2)
+        # Advertise 7-dim OSC action; server also accepts a 4-dim shorthand at step()
         # Bounds are abstract; client re-normalizes for policy.
         image_shapes = {"head": [self.height, self.width, 3], "wrist": [self.height, self.width, 3]}
 
@@ -123,12 +160,17 @@ class LiberoRemoteServer:
                 state_vecs.append(obs["robot0_gripper_qpos"].astype(np.float32, copy=False).reshape(-1))
             if "robot0_eef_pos" in obs:
                 state_vecs.append(obs["robot0_eef_pos"].astype(np.float32, copy=False).reshape(-1))
-        state = np.concatenate(state_vecs, axis=0) if state_vecs else np.zeros((18,), dtype=np.float32)
-        state_dim = int(state.size)
+        # Mirror the 15-dim state guarantee from _obs_to_message
+        state = np.concatenate(state_vecs, axis=0) if state_vecs else np.zeros((15,), dtype=np.float32)
+        if state.size < 15:
+            state = np.concatenate([state, np.zeros((15 - state.size,), dtype=np.float32)], axis=0)
+        elif state.size > 15:
+            state = state[:15]
+        state_dim = 15
 
         return {
             "status": "ok",
-            "action_dim": 4,
+            "action_dim": 7,
             "action_low": -1.0,
             "action_high": 1.0,
             "state_dim": state_dim,
@@ -147,15 +189,17 @@ class LiberoRemoteServer:
                     _send_msg(conn, {"status": "ok", "observation": self._obs_to_message(obs), "info": {}})
                 elif cmd == "step":
                     act = _decode_ndarray(msg["action"])  # type: ignore[index]
-                    # Map 4-dim action to 7-dim robot action expected by robosuite: here we do a simple noop mapping
-                    # You can extend this to proper EE deltas or joint mapping if desired.
-                    # For now, use OSC pose: [dx, dy, dz, 0, 0, 0, gripper]
-                    if act.shape[0] >= 4:
+                    # Support two input formats:
+                    # - 7-dim OSC pose: [dx, dy, dz, dRx, dRy, dRz, gripper]
+                    # - 4-dim shorthand: [dx, dy, dz, gripper] → expand with zeros for rotation
+                    if act.shape[0] == 7:
+                        action_rs = act.astype(np.float32, copy=False)
+                    elif act.shape[0] >= 4:
                         action_rs = np.zeros((7,), dtype=np.float32)
                         action_rs[:3] = act[:3]
-                        # Gripper: map 0,1,2 to -1,0,1
                         g = float(act[3])
-                        action_rs[-1] = -1.0 if g < 0.5 else (1.0 if g > 1.5 else 0.0)
+                        # Symmetric thresholding for gripper in [-1, 1]
+                        action_rs[-1] = -1.0 if g < -0.5 else (1.0 if g > 0.5 else 0.0)
                     else:
                         action_rs = np.zeros((7,), dtype=np.float32)
 
